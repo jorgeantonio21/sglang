@@ -298,7 +298,7 @@ class EAGLEWorker(TpModelWorker):
 
     def forward_batch_speculative_generation(
         self, batch: ScheduleBatch
-    ) -> Tuple[LogitsProcessorOutput, List[int], int, int]:
+    ) -> Tuple[LogitsProcessorOutput, List[int], int, int, bool]:
         """Run speculative decoding forward.
 
         NOTE: Many states of batch is modified as you go through. It is not guaranteed that
@@ -310,7 +310,7 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
-        if batch.forward_mode.is_mized and self._has_decode_requests(batch):
+        if batch.forward_mode.is_mixed() and self._has_decode_requests(batch):
             return self._forward_mixed_batch(batch)
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             logits_output, next_token_ids, bid, seq_lens_cpu = (
@@ -343,9 +343,10 @@ class EAGLEWorker(TpModelWorker):
         
     def _has_decode_requests(self, batch: ScheduleBatch) -> bool:
         """Check if the current batch contains decode requests."""
-        return (hasattr(batch, 'decoding_reqs') and 
-                batch.decoding_reqs is not None and 
-                len(batch.decoding_reqs) > 0)
+        for req in batch.reqs:
+            if req.extend_input_len <= 1:
+                return True
+        return False
     
     def _forward_mixed_batch(
             self, batch: ScheduleBatch
@@ -376,7 +377,7 @@ class EAGLEWorker(TpModelWorker):
             self._handle_mixed_draft_extend(batch, verify_output, prefill_indices)
 
         return (
-            verify_output.logits_output,
+            logits_output,
             verify_output.verified_id.tolist(),
             model_worker_batch.bid,
             sum(verify_output.accept_length_per_req_cpu),
@@ -389,9 +390,9 @@ class EAGLEWorker(TpModelWorker):
         decode_indices = []
         
         for i, req in enumerate(batch.reqs):
-            if req.extend_input_len > 1:  # Prefill/chunked request
+            if req.extend_input_len > 1:
                 prefill_indices.append(i)
-            elif hasattr(batch, 'decoding_reqs') and batch.decoding_reqs and req in batch.decoding_reqs:
+            else:
                 decode_indices.append(i)
         
         return prefill_indices, decode_indices
@@ -418,29 +419,24 @@ class EAGLEWorker(TpModelWorker):
             tree_cache=batch.tree_cache,
             model_config=batch.model_config,
             forward_mode=ForwardMode.DECODE,
-            device=batch.device,
         )
         
         # Copy sampling info
         if hasattr(batch, 'sampling_info'):
             sub_batch.sampling_info = batch.sampling_info
-        
-        # Set up decode-specific spec info from previous iterations
-        if hasattr(batch, 'decoding_reqs') and batch.decoding_reqs:
-            # Get the existing draft input from the batch if available
-            if hasattr(batch, 'spec_info') and batch.spec_info:
-                sub_batch.spec_info = batch.spec_info
+                
+        device = batch.req_pool_indices.device if batch.req_pool_indices is not None else 'cuda'
         
         # Filter batch tensors for decode requests
         if decode_indices:
-            decode_indices_tensor = torch.tensor(decode_indices, device=batch.device)
+            decode_indices_tensor = torch.tensor(decode_indices, device=device)
             if batch.req_pool_indices is not None:
                 sub_batch.req_pool_indices = batch.req_pool_indices[decode_indices_tensor]
             if batch.seq_lens is not None:
                 sub_batch.seq_lens = batch.seq_lens[decode_indices_tensor]
         else:
-            sub_batch.req_pool_indices = torch.empty(0, dtype=torch.long, device=batch.device)
-            sub_batch.seq_lens = torch.empty(0, dtype=torch.long, device=batch.device)
+            sub_batch.req_pool_indices = torch.empty(0, dtype=torch.long, device=device)
+            sub_batch.seq_lens = torch.empty(0, dtype=torch.long, device=device)
         
         return sub_batch
         
@@ -755,6 +751,7 @@ class EAGLEWorker(TpModelWorker):
                 self.speculative_num_draft_tokens if spec_info.decode_indices else 1
             )
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            vocab_mask = None  # Skip grammar for mixed batches for now
         else:
             model_worker_batch = batch.get_model_worker_batch(
                 seq_lens_cpu_cache=spec_info.seq_lens_cpu
@@ -763,34 +760,31 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch.capture_hidden_mode = spec_info.capture_hidden_mode
             assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
-        # Handle grammar (only for standard EAGLE inputs, not mixed)
-        if (batch.has_grammar and 
-            isinstance(spec_info, EagleVerifyInput) and 
-            not isinstance(spec_info, MixedBatchVerifyInput)):
-            
-            retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
-            retrieve_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()
-            draft_tokens_cpu = spec_info.draft_token.view(
-                spec_info.retrive_next_token.shape
-            ).cpu()
+            vocab_mask = None
+            if batch.has_grammar:
+                retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
+                retrieve_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()
+                draft_tokens_cpu = spec_info.draft_token.view(
+                    spec_info.retrive_next_token.shape
+                ).cpu()
 
-            # Generate the logit mask for structured output.
-            # Overlap the CPU operations for bitmask generation with the forward pass.
-            vocab_mask = generate_token_bitmask(
-                batch.reqs,
-                spec_info,
-                retrieve_next_token_cpu,
-                retrieve_next_sibling_cpu,
-                draft_tokens_cpu,
-                batch.sampling_info.vocab_size,
-            )
+                # Generate the logit mask for structured output.
+                # Overlap the CPU operations for bitmask generation with the forward pass.
+                vocab_mask = generate_token_bitmask(
+                    batch.reqs,
+                    spec_info,
+                    retrieve_next_token_cpu,
+                    retrieve_next_sibling_cpu,
+                    draft_tokens_cpu,
+                    batch.sampling_info.vocab_size,
+                )
 
-            if vocab_mask is not None:
-                assert spec_info.grammar is not None
-                vocab_mask = vocab_mask.to(spec_info.retrive_next_token.device)
-                # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
-                # and will be applied to produce wrong results
-                batch.sampling_info.vocab_mask = None
+                if vocab_mask is not None:
+                    assert spec_info.grammar is not None
+                    vocab_mask = vocab_mask.to(spec_info.retrive_next_token.device)
+                    # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
+                    # and will be applied to produce wrong results
+                    batch.sampling_info.vocab_mask = None
 
         # Forward pass for both prefill and decode
         logits_output, _, can_run_cuda_graph = (
@@ -800,7 +794,11 @@ class EAGLEWorker(TpModelWorker):
         )
 
         self._detect_nan_if_needed(logits_output)
-        spec_info.hidden_states = logits_output.hidden_states
+        
+        # Do not assign hidden states for mixed batches to avoid overwriting
+        if not isinstance(spec_info, MixedBatchVerifyInput):
+            spec_info.hidden_states = logits_output.hidden_states
+            
         res: EagleVerifyOutput = spec_info.verify(
             batch,
             logits_output,
@@ -858,7 +856,7 @@ class EAGLEWorker(TpModelWorker):
         
         # Create seq_lens_cpu for prefill requests
         seq_lens_cpu = torch.tensor(
-            [len(batch.reqs[i].fill_ids) for i in prefill_indices], 
+            [len(batch.reqs[i].origin_input_ids) for i in prefill_indices], 
             dtype=torch.int32
         )
         
@@ -879,19 +877,19 @@ class EAGLEWorker(TpModelWorker):
         if logits_output.hidden_states is None:
             # Return empty tensor with correct shape
             hidden_size = getattr(self.model_config, 'hidden_size', 4096)
-            return torch.empty(0, hidden_size, device=self.device)
+            return torch.empty(0, hidden_size, device=self.device, dtype=self.model_config.dtype)
         
         # Prefill hidden states are at the beginning of the output
         prefill_count = len(prefill_indices)
-        if prefill_count > 0:
+        if prefill_count > 0 and prefill_count <= logits_output.hidden_states.shape[0]:
             return logits_output.hidden_states[:prefill_count]
         else:
-            return torch.empty(0, logits_output.hidden_states.shape[-1], device=self.device)
+            return torch.empty(0, logits_output.hidden_states.shape[-1], device=self.device, dtype=logits_output.hidden_states.dtype)
 
     def _create_prefill_sub_batch(self, batch: ScheduleBatch, prefill_indices: List[int]) -> ScheduleBatch:
         """Create sub-batch containing only prefill requests."""
         prefill_reqs = [batch.reqs[i] for i in prefill_indices]
-        
+                
         sub_batch = ScheduleBatch(
             reqs=prefill_reqs,
             req_to_token_pool=batch.req_to_token_pool,
@@ -899,23 +897,24 @@ class EAGLEWorker(TpModelWorker):
             tree_cache=batch.tree_cache,
             model_config=batch.model_config,
             forward_mode=ForwardMode.EXTEND,
-            device=batch.device,
         )
         
         # Copy sampling info
-        if hasattr(batch, 'sampling_info'):
+        if hasattr(batch, 'sampling_info') and batch.sampling_info is not None:
             sub_batch.sampling_info = batch.sampling_info
+        
+        device = batch.req_pool_indices.device if batch.req_pool_indices is not None else self.device
         
         # Filter tensors for prefill requests
         if prefill_indices:
-            prefill_indices_tensor = torch.tensor(prefill_indices, device=batch.device)
-            if batch.req_pool_indices is not None:
+            prefill_indices_tensor = torch.tensor(prefill_indices, device=device)
+            if batch.req_pool_indices is not None and len(batch.req_pool_indices) > max(prefill_indices):
                 sub_batch.req_pool_indices = batch.req_pool_indices[prefill_indices_tensor]
-            if batch.seq_lens is not None:
+            if batch.seq_lens is not None and len(batch.seq_lens) > max(prefill_indices):
                 sub_batch.seq_lens = batch.seq_lens[prefill_indices_tensor]
         else:
-            sub_batch.req_pool_indices = torch.empty(0, dtype=torch.long, device=batch.device)
-            sub_batch.seq_lens = torch.empty(0, dtype=torch.long, device=batch.device)
+            sub_batch.req_pool_indices = torch.empty(0, dtype=torch.long, device=device)
+            sub_batch.seq_lens = torch.empty(0, dtype=torch.long, device=device)
         
         return sub_batch
 
