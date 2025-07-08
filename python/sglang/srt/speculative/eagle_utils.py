@@ -701,12 +701,6 @@ class MixedBatchVerifyInput(EagleVerifyInput):
         """Create mixed batch verify input from standard EAGLE input and batch info."""
 
         device = batch.device if batch.device is not None else 'cuda'
-        if batch.req_pool_indices is not None:
-            device = batch.req_pool_indices.device
-        elif batch.seq_lens is not None:
-            device = batch.seq_lens.device
-        elif batch.input_ids is not None:
-            device = batch.input_ids.device
 
         prefill_token_count = sum(
             batch.reqs[i].extend_input_len for i in prefill_indices
@@ -782,14 +776,6 @@ class MixedBatchVerifyInput(EagleVerifyInput):
     def _create_unified_input_ids(self, batch: ScheduleBatch) -> torch.Tensor:
         """Create unified `input_ids` tensor containing prefill + draft tokens."""
 
-        device = batch.device if batch.device is not None else 'cuda'
-        if batch.req_pool_indices is not None:
-            device = batch.req_pool_indices.device
-        elif batch.seq_lens is not None:
-            device = batch.seq_lens.device
-        elif batch.input_ids is not None:
-            device = batch.input_ids.device
-
         prefill_tokens = []
         current_pos = 0
 
@@ -811,21 +797,15 @@ class MixedBatchVerifyInput(EagleVerifyInput):
         if all_tokens:
             return torch.cat(all_tokens, dim=0)
         else:
+            device = batch.device if batch.device is not None else 'cuda'
             return torch.empty(0, dtype=torch.long, device=device)
 
     def _allocate_unified_cache(self, batch: ScheduleBatch, page_size: int) -> torch.Tensor:
         """Allocate cache for both prefill and speculation tokens, for the target model."""
 
-        device = batch.device if batch.device is not None else 'cuda'
-        if batch.req_pool_indices is not None:
-            device = batch.req_pool_indices.device
-        elif batch.seq_lens is not None:
-            device = batch.seq_lens.device
-        elif batch.input_ids is not None:
-            device = batch.input_ids.device
-
         total_tokens = self.prefill_token_count + self.decode_token_count
         if total_tokens == 0:
+            device = batch.device if batch.device is not None else 'cuda'
             return torch.empty(0, dtype=torch.long, device=device)
         
         return batch.alloc_token_slots(total_tokens)
@@ -926,12 +906,6 @@ class MixedBatchVerifyInput(EagleVerifyInput):
         """Process decode portion using parent class EAGLE verification logic."""
         
         device = batch.device if batch.device is not None else 'cuda'
-        if batch.req_pool_indices is not None:
-            device = batch.req_pool_indices.device
-        elif batch.seq_lens is not None:
-            device = batch.seq_lens.device
-        elif batch.input_ids is not None:
-            device = batch.input_ids.device
         
         if not self.decode_indices or decode_logits.next_token_logits is None:
             return {
@@ -980,12 +954,6 @@ class MixedBatchVerifyInput(EagleVerifyInput):
         decode_reqs = [original_batch.reqs[i] for i in self.decode_indices]
         
         device = original_batch.device if original_batch.device is not None else 'cuda'
-        if original_batch.req_pool_indices is not None:
-            device = original_batch.req_pool_indices.device
-        elif original_batch.seq_lens is not None:
-            device = original_batch.seq_lens.device
-        elif original_batch.input_ids is not None:
-            device = original_batch.input_ids.device
         
         # Create new ScheduleBatch instance
         sub_batch = ScheduleBatch(
@@ -1017,27 +985,22 @@ class MixedBatchVerifyInput(EagleVerifyInput):
     def _merge_mixed_results(self, prefill_results: Dict, decode_results: Dict, batch: ScheduleBatch) -> EagleVerifyOutput:
         """Merge prefill and decode results back to original request order."""
         
-        device = getattr(batch, 'device', None) or ('cuda' if batch.req_pool_indices is None else batch.req_pool_indices.device)
-        if batch.req_pool_indices is not None:
-            device = batch.req_pool_indices.device
-        elif batch.seq_lens is not None:
-            device = batch.seq_lens.device
-        elif batch.input_ids is not None:
-            device = batch.input_ids.device
+        device = batch.device if batch.device is not None else 'cuda'
         
         # Create merged token array in original request order
         merged_tokens = torch.zeros(len(batch.reqs), dtype=torch.long, device=device)
         
         # Fill prefill tokens
+        prefill_results = prefill_results["next_tokens"]
+        assert len(prefill_results) == len(self.prefill_indices)
         for i, prefill_idx in enumerate(self.prefill_indices):
-            if i < len(prefill_results["next_tokens"]):
-                merged_tokens[prefill_idx] = prefill_results["next_tokens"][i]
+            merged_tokens[prefill_idx] = prefill_results[i]
         
         # Fill decode tokens
         decode_tokens = decode_results["verified_tokens"]
+        assert len(decode_tokens) == len(self.decode_indices)
         for i, decode_idx in enumerate(self.decode_indices):
-            if i < len(decode_tokens):
-                merged_tokens[decode_idx] = decode_tokens[i]
+            merged_tokens[decode_idx] = decode_tokens[i]
         
         # Merge accepted indices
         prefill_accepted = torch.arange(len(self.prefill_indices), dtype=torch.long, device=device)
@@ -1098,12 +1061,6 @@ class MixedBatchVerifyInput(EagleVerifyInput):
         hidden_size = batch.model_config.hidden_size
         
         device = batch.device if batch.device is not None else 'cuda'
-        if batch.req_pool_indices is not None:
-            device = batch.req_pool_indices.device
-        elif batch.seq_lens is not None:
-            device = batch.seq_lens.device
-        elif batch.input_ids is not None:
-            device = batch.input_ids.device
         
         return EagleVerifyOutput(
             draft_input=EagleDraftInput.create_idle_input(

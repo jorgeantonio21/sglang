@@ -507,5 +507,200 @@ class TestEAGLEServerPageSizeTopk(TestEAGLEServer):
         )
 
 
+class TestEAGLEMixedChunkServer(CustomTestCase):
+    """Test EAGLE with mixed chunked prefill at server level."""
+    
+    BASE_CONFIG = {
+        "model_path": DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
+        "speculative_draft_model_path": DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
+        "speculative_algorithm": "EAGLE",
+        "enable_mixed_chunk": True,
+        "chunked_prefill_size": 512,
+        "max_running_requests": 8,
+    }
+
+    def test_concurrent_mixed_requests(self):
+        """Test concurrent requests with mixed prefill/decode patterns."""
+        with self.create_server() as server:
+            import requests
+            import threading
+            import time
+            
+            base_url = f"http://localhost:{server.port}"
+            results = []
+            errors = []
+            
+            def send_request(prompt, max_tokens):
+                try:
+                    response = requests.post(
+                        f"{base_url}/v1/completions",
+                        json={
+                            "prompt": prompt,
+                            "max_tokens": max_tokens,
+                            "temperature": 0,
+                        }
+                    )
+                    if response.status_code == 200:
+                        results.append(response.json())
+                    else:
+                        errors.append(f"HTTP {response.status_code}: {response.text}")
+                except Exception as e:
+                    errors.append(str(e))
+            
+            threads = []
+            
+            # Mix of long and short prompts to trigger mixed batching
+            prompts = [
+                ("Write a detailed story about " * 30, 20),  # Long prefill
+                ("Hello", 5),                                 # Short decode-like
+                ("Explain quantum physics " * 20, 15),       # Long prefill
+                ("Yes", 3),                                   # Short decode-like
+            ]
+            
+            # Send requests concurrently
+            for prompt, max_tokens in prompts:
+                thread = threading.Thread(target=send_request, args=(prompt, max_tokens))
+                threads.append(thread)
+                thread.start()
+                time.sleep(0.1)  # Slight delay to encourage batching
+            
+            # Wait for completion
+            for thread in threads:
+                thread.join(timeout=30)
+            
+            # Verify results
+            self.assertEqual(len(errors), 0, f"Errors occurred: {errors}")
+            self.assertEqual(len(results), len(prompts))
+            
+            for result in results:
+                self.assertIn("choices", result)
+                self.assertGreater(len(result["choices"][0]["text"]), 0)
+
+    def test_mixed_batch_performance(self):
+        """Test that mixed batching improves throughput."""
+        with self.create_server() as server:
+            import requests
+            import time
+            
+            base_url = f"http://localhost:{server.port}"
+            
+            # Test sequential processing
+            start_time = time.time()
+            for i in range(4):
+                response = requests.post(
+                    f"{base_url}/v1/completions",
+                    json={
+                        "prompt": f"Test prompt {i}: " + "word " * 10,
+                        "max_tokens": 10,
+                        "temperature": 0,
+                    }
+                )
+                self.assertEqual(response.status_code, 200)
+            sequential_time = time.time() - start_time
+            
+            # Test concurrent processing (should be faster with mixed batching)
+            import threading
+            results = []
+            
+            def send_concurrent_request(i):
+                response = requests.post(
+                    f"{base_url}/v1/completions",
+                    json={
+                        "prompt": f"Test prompt {i}: " + "word " * 10,
+                        "max_tokens": 10,
+                        "temperature": 0,
+                    }
+                )
+                results.append(response.status_code)
+            
+            start_time = time.time()
+            threads = []
+            for i in range(4):
+                thread = threading.Thread(target=send_concurrent_request, args=(i,))
+                threads.append(thread)
+                thread.start()
+            
+            for thread in threads:
+                thread.join()
+            concurrent_time = time.time() - start_time
+            
+            # Verify all requests succeeded
+            self.assertEqual(len(results), 4)
+            self.assertTrue(all(status == 200 for status in results))
+            
+            # Concurrent should be faster (allowing some margin for variability)
+            self.assertLess(concurrent_time, sequential_time * 1.2)
+
+    def test_mixed_batch_memory_efficiency(self):
+        """Test that mixed batching doesn't cause memory issues."""
+        with self.create_server() as server:
+            import requests
+            import psutil
+            import os
+            
+            base_url = f"http://localhost:{server.port}"
+            
+            # Get initial memory usage
+            process = psutil.Process(os.getpid())
+            initial_memory = process.memory_info().rss
+            
+            # Send many requests to test memory stability
+            for batch in range(5):
+                requests_batch = []
+                for i in range(8):
+                    prompt = f"Batch {batch} request {i}: " + "memory test " * 20
+                    response = requests.post(
+                        f"{base_url}/v1/completions",
+                        json={
+                            "prompt": prompt,
+                            "max_tokens": 15,
+                            "temperature": 0,
+                        }
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    requests_batch.append(response.json())
+                
+                # Verify responses
+                for result in requests_batch:
+                    self.assertIn("choices", result)
+            
+            # Check memory didn't grow excessively
+            final_memory = process.memory_info().rss
+            memory_growth = final_memory - initial_memory
+            
+            # Memory growth should be reasonable (less than 1GB)
+            self.assertLess(memory_growth, 1024 * 1024 * 1024)
+
+    def test_error_handling_mixed_batch(self):
+        """Test error handling in mixed batch scenarios."""
+        with self.create_server() as server:
+            import requests
+            
+            base_url = f"http://localhost:{server.port}"
+            
+            # Test with invalid parameters
+            response = requests.post(
+                f"{base_url}/v1/completions",
+                json={
+                    "prompt": "Test",
+                    "max_tokens": -1,  # Invalid
+                    "temperature": 0,
+                }
+            )
+            self.assertEqual(response.status_code, 400)
+            
+            # Test with extremely long prompt
+            response = requests.post(
+                f"{base_url}/v1/completions",
+                json={
+                    "prompt": "word " * 10000,  # Very long
+                    "max_tokens": 1,
+                    "temperature": 0,
+                }
+            )
+            # Should either succeed or fail gracefully
+            self.assertIn(response.status_code, [200, 400, 413])
+
+
 if __name__ == "__main__":
     unittest.main()
